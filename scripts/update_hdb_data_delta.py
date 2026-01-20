@@ -1,6 +1,6 @@
 """
 Delta/Incremental Update Script for HDB Resale Data from data.gov.sg
------------------------------------------------------------------------
+--------------------------------------------------------------------
 
 This script performs the SAME preprocessing and transformation steps as:
 - 1-VisualStudio_DataPreproceses.ipynb (preprocessing)

@@ -1,0 +1,143 @@
+name: Update HDB Data (Delta)
+
+on:
+  schedule:
+    # Run every Monday, Wednesday, Friday at 2 AM UTC (10 AM SGT / Singapore Time)
+    # Cron format: minute hour day-of-month month day-of-week
+    - cron: '0 2 * * 1,3,5'
+  workflow_dispatch:  # Allow manual trigger from GitHub Actions UI
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'scripts/update_hdb_data_delta.py'
+      - '.github/workflows/update-hdb-data.yml'
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0  # Fetch all history for better diff detection
+          
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          
+      - name: Check if last sync file exists
+        id: check_sync
+        run: |
+          if [ -f ".last_sync_date.txt" ]; then
+            echo "last_sync_exists=true" >> $GITHUB_OUTPUT
+            echo "Last sync date: $(cat .last_sync_date.txt)"
+          else
+            echo "last_sync_exists=false" >> $GITHUB_OUTPUT
+            echo "No last sync file found. Will perform full sync."
+          fi
+          
+      - name: Run delta update script
+        id: update_data
+        run: |
+          echo "🔄 Running HDB data delta update..."
+          if [ "${{ steps.check_sync.outputs.last_sync_exists }}" == "false" ]; then
+            echo "Running full sync (first time)..."
+            python scripts/update_hdb_data_delta.py --full
+          else
+            echo "Running incremental sync (delta)..."
+            python scripts/update_hdb_data_delta.py
+          fi
+          
+          # Check if any changes were made
+          if git diff --quiet raw_data_main.csv .last_sync_date.txt; then
+            echo "data_updated=false" >> $GITHUB_OUTPUT
+            echo "✅ No new data to update."
+          else
+            echo "data_updated=true" >> $GITHUB_OUTPUT
+            echo "✅ Data updated successfully!"
+          fi
+          
+      - name: Regenerate precomputed market data
+        if: steps.update_data.outputs.data_updated == 'true'
+        continue-on-error: true
+        run: |
+          echo "📊 Regenerating precomputed market segmentation data..."
+          if [ -f "5-2_precompute_market.py" ]; then
+            if [ -f "hybrid_multi_metric_pipeline_50K.pkl" ]; then
+              python 5-2_precompute_market.py
+              echo "✅ Precomputed market data regenerated."
+            else
+              echo "⚠️ Warning: hybrid_multi_metric_pipeline_50K.pkl not found. Skipping precomputation."
+            fi
+          else
+            echo "⚠️ Warning: 5-2_precompute_market.py not found. Skipping precomputation."
+          fi
+          
+      - name: Check for changes
+        id: check_changes
+        if: steps.update_data.outputs.data_updated == 'true'
+        run: |
+          git add raw_data_main.csv 5-4_precomputed_market.pkl .last_sync_date.txt
+          
+          if git diff --staged --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes to commit."
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Changes detected. Preparing to commit..."
+          fi
+          
+      - name: Commit and push changes
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # Create commit message with timestamp
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          COMMIT_MSG="Auto-update HDB data (delta) [skip ci] - $TIMESTAMP"
+          
+          git commit -m "$COMMIT_MSG"
+          git push
+          
+          echo "✅ Changes committed and pushed successfully!"
+          
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 📊 HDB Data Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.update_data.outputs.data_updated }}" == "true" ]; then
+            echo "✅ **Status:** Data updated successfully" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📅 **Last sync date:** \`$(cat .last_sync_date.txt)\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ -f "raw_data_main.csv" ]; then
+              ROW_COUNT=$(wc -l < raw_data_main.csv)
+              echo "📊 **Total records in raw_data_main.csv:** $ROW_COUNT" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "ℹ️ **Status:** No new data to update" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ -f ".last_sync_date.txt" ]; then
+              echo "📅 **Last sync date:** \`$(cat .last_sync_date.txt)\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔄 **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "⏰ **Time:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> $GITHUB_STEP_SUMMARY

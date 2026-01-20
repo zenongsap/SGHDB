@@ -6,3 +6,4 @@ scikit-learn
 prophet
 catboost
 joblib
+umap-learn

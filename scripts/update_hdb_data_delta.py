@@ -51,11 +51,35 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 
 
 def get_last_sync_date() -> str | None:
-    """Returns the last synced month (YYYY-MM format) or None if never synced."""
+    """
+    Returns the last synced month (YYYY-MM format) or None if never synced.
+    If .last_sync_date.txt doesn't exist, tries to infer from raw_data_main.csv.
+    """
     sync_file = PROJECT_ROOT / LAST_SYNC_FILE
     if sync_file.exists():
         with open(sync_file, "r") as f:
-            return f.read().strip()
+            date_str = f.read().strip()
+            if date_str:
+                return date_str
+    
+    # If sync file doesn't exist, check CSV file for latest month
+    csv_file = PROJECT_ROOT / CSV_FILE
+    if csv_file.exists():
+        try:
+            df = pd.read_csv(csv_file, nrows=1000)  # Read sample to check structure
+            if 'YEAR' in df.columns and 'MONTH_NUM' in df.columns:
+                # Read full file to get latest date
+                df_full = pd.read_csv(csv_file)
+                if len(df_full) > 0:
+                    # Get the latest year and month
+                    latest_year = df_full['YEAR'].max()
+                    latest_month_num = df_full[df_full['YEAR'] == latest_year]['MONTH_NUM'].max()
+                    latest_month = f"{int(latest_year)}-{int(latest_month_num):02d}"
+                    print(f"📅 Inferred last sync date from CSV: {latest_month}")
+                    return latest_month
+        except Exception as e:
+            print(f"⚠️ Could not infer sync date from CSV: {e}")
+    
     return None
 
 
@@ -68,67 +92,134 @@ def save_last_sync_date(month: str):
 
 def fetch_all_records_since(month_start: str | None = None):
     """
-    Fetches all records from data.gov.sg API.
-    If month_start is provided, only fetches records where month >= month_start.
+    Fetches records from data.gov.sg API efficiently.
     
-    Returns: DataFrame with all fetched records (raw API format)
+    Strategy:
+    - If month_start is provided (incremental sync): Fetch in REVERSE chronological order
+      (newest first) and stop once we hit records older than month_start. This is much faster!
+    - If no month_start (full sync): Fetch all records in chronological order
+    
+    Returns: DataFrame with fetched records (raw API format), filtered by month_start if provided
     """
     all_records = []
     offset = 0
     limit = 1000  # Max records per request
+    max_records_to_fetch = 50000  # Safety limit for incremental sync (fetch max 50K records)
     
-    # Build filter if we're doing incremental sync
-    filters = {}
     if month_start:
-        # Filter for months >= month_start
-        filters["month"] = {"$gte": month_start}
+        # OPTIMIZED: Fetch in reverse order (newest first) and stop when we hit old records
+        print(f"📥 Fetching records in reverse chronological order (newest first)...")
+        print(f"   Will stop when we reach records older than {month_start}")
+        sort_order = "month desc"  # Reverse chronological order
+        stop_when_older_than = month_start
+    else:
+        # Full sync: fetch all records in chronological order
+        print(f"📥 Fetching all records (full sync)...")
+        sort_order = "month"  # Chronological order
+        stop_when_older_than = None
+        max_records_to_fetch = None  # No limit for full sync
     
-    print(f"📥 Fetching records{' since ' + month_start if month_start else ' (full sync)'}...")
+    max_iterations = 1000  # Safety limit to prevent infinite loops
+    iteration = 0
     
-    while True:
+    while iteration < max_iterations:
+        # Check if we've hit the limit for incremental sync
+        if max_records_to_fetch and len(all_records) >= max_records_to_fetch:
+            print(f"  ℹ️ Reached safety limit of {max_records_to_fetch:,} records for incremental sync")
+            break
+        
         params = {
             "resource_id": DATASET_ID,
             "limit": limit,
             "offset": offset,
-            "sort": "month"  # Sort by month to get chronological order
+            "sort": sort_order
         }
         
-        # Add filters if specified
-        if filters:
-            params["filters"] = json.dumps(filters)
-        
         try:
-            response = requests.get(API_BASE, params=params, timeout=30)
+            response = requests.get(API_BASE, params=params, timeout=60)
             response.raise_for_status()
             data = response.json()
             
             if not data.get("success"):
-                print(f"❌ API error: {data.get('error', 'Unknown error')}")
+                error_msg = data.get('error', 'Unknown error')
+                print(f"❌ API error: {error_msg}")
                 break
             
             records = data["result"]["records"]
             if not records:
+                print(f"  ℹ️ No more records at offset {offset}")
                 break
             
-            all_records.extend(records)
-            print(f"  ✅ Fetched {len(records)} records (total: {len(all_records):,})...")
+            # Show sample of what we're getting
+            if offset == 0 and records:
+                sample_month = records[0].get("month", "")
+                print(f"  📅 Sample month from first batch: {sample_month}")
             
-            # Check if we've reached the end
+            # For incremental sync: Check if we've reached records older than month_start
+            if stop_when_older_than and records:
+                # Check the last record in this batch (oldest in reverse order)
+                oldest_in_batch = records[-1].get("month", "")
+                if oldest_in_batch and oldest_in_batch < stop_when_older_than:
+                    # We've reached records older than what we need
+                    # Keep only records >= month_start
+                    new_records = [r for r in records if r.get("month", "") >= stop_when_older_than]
+                    if new_records:
+                        all_records.extend(new_records)
+                        print(f"  ✅ Fetched {len(new_records)} records (total: {len(all_records):,})...")
+                    print(f"  🛑 Reached records older than {stop_when_older_than}. Stopping fetch.")
+                    break
+                else:
+                    # All records in this batch are new enough
+                    all_records.extend(records)
+                    print(f"  ✅ Fetched {len(records)} records (total: {len(all_records):,})...")
+            else:
+                # Full sync: add all records
+                all_records.extend(records)
+                print(f"  ✅ Fetched {len(records)} records (total: {len(all_records):,})...")
+            
+            # Check if we've reached the end (API returns fewer than limit)
             if len(records) < limit:
+                print(f"  ℹ️ Reached end of data (got {len(records)} < {limit} records)")
                 break
             
             offset += limit
+            iteration += 1
+            
+            # Progress indicator every 10 iterations
+            if iteration % 10 == 0:
+                print(f"  📊 Progress: {len(all_records):,} records fetched so far...")
             
         except requests.RequestException as e:
-            print(f"❌ Error fetching data: {e}")
+            print(f"❌ Error fetching data at offset {offset}: {e}")
             break
     
     if not all_records:
-        print("⚠️ No new records found.")
+        print("⚠️ No records found from API.")
         return None
     
     df = pd.DataFrame(all_records)
-    print(f"✅ Total records fetched: {len(df):,}")
+    print(f"✅ Total records fetched from API: {len(df):,}")
+    
+    # Final filter by month_start in Python (double-check, in case reverse order didn't work)
+    if month_start and "month" in df.columns:
+        initial_count = len(df)
+        # Ensure month column is string for comparison
+        df["month"] = df["month"].astype(str)
+        df_filtered = df[df["month"] >= month_start].copy()
+        filtered_count = len(df_filtered)
+        
+        if filtered_count < initial_count:
+            print(f"📊 Final filter: {filtered_count:,} records with month >= {month_start} (removed {initial_count - filtered_count:,} older records)")
+        
+        if len(df_filtered) == 0:
+            print(f"⚠️ No records found with month >= {month_start}")
+            if len(df) > 0:
+                available_months = sorted(df['month'].unique())
+                print(f"   Available months in fetched data: {available_months[-10:]}")
+            return None
+        
+        return df_filtered
+    
     return df
 
 
@@ -428,14 +519,41 @@ def update_data(incremental: bool = True):
     print("=" * 70)
     
     last_sync_month = get_last_sync_date() if incremental else None
-    if last_sync_month:
-        print(f"Last sync date: {last_sync_month}")
+    
+    # Calculate the month to fetch from
+    if incremental and last_sync_month:
+        print(f"📅 Last sync date: {last_sync_month}")
+        # For incremental sync, fetch data starting from the NEXT month
+        # If last sync was 2025-08, we want data from 2025-09 onwards
+        try:
+            year, month = last_sync_month.split('-')
+            year, month = int(year), int(month)
+            # Calculate next month
+            if month == 12:
+                next_year = year + 1
+                next_month = 1
+            else:
+                next_year = year
+                next_month = month + 1
+            fetch_from_month = f"{next_year}-{next_month:02d}"
+            print(f"📥 Fetching data from {fetch_from_month} onwards...")
+        except Exception as e:
+            # If parsing fails, use the original date
+            print(f"⚠️ Could not parse last sync date, using as-is: {e}")
+            fetch_from_month = last_sync_month
+    else:
+        fetch_from_month = None
+        if not incremental:
+            print("📥 Performing full sync (fetching all data)...")
     
     # Step 1: Fetch raw data from API
-    df_new = fetch_all_records_since(last_sync_month)
+    df_new = fetch_all_records_since(fetch_from_month)
     
     if df_new is None or len(df_new) == 0:
-        print("\n✅ No new data to update.")
+        if last_sync_month:
+            print(f"\n✅ No new data to update since {last_sync_month}.")
+        else:
+            print("\n✅ No new data to update.")
         return None
     
     # Step 2: Preprocess (from 1-VisualStudio_DataPreproceses.ipynb)
@@ -467,8 +585,9 @@ def update_data(incremental: bool = True):
         print(f"✅ Last sync date updated to: {latest_month}")
     elif 'YEAR' in df_transformed.columns and 'MONTH_NUM' in df_transformed.columns:
         # Fallback: construct from YEAR and MONTH_NUM
-        latest_row = df_transformed.loc[df_transformed[['YEAR', 'MONTH_NUM']].idxmax()]
+        latest_row = df_transformed.sort_values(by=["YEAR", "MONTH_NUM"], ascending=[True, True]).iloc[-1]
         latest_month = f"{int(latest_row['YEAR'])}-{int(latest_row['MONTH_NUM']):02d}"
+
         save_last_sync_date(latest_month)
         print(f"✅ Last sync date updated to: {latest_month}")
     
@@ -484,7 +603,14 @@ if __name__ == "__main__":
     full_sync = "--full" in sys.argv
     
     try:
-        update_data(incremental=not full_sync)
+        result = update_data(incremental=not full_sync)
+        # Exit successfully even if no new data (this is normal)
+        if result is None:
+            print("\n✅ Script completed successfully (no new data to update).")
+            sys.exit(0)
+        else:
+            print("\n✅ Script completed successfully (data updated).")
+            sys.exit(0)
     except KeyboardInterrupt:
         print("\n\n⚠️ Update cancelled by user.")
         sys.exit(1)
